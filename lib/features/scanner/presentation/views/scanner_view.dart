@@ -1,5 +1,7 @@
 import 'dart:async';
+import 'dart:collection';
 
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
@@ -19,17 +21,17 @@ class ScannerView extends ConsumerStatefulWidget {
 }
 
 class _ScannerViewState extends ConsumerState<ScannerView> {
-  final MobileScannerController _cameraController =
-  MobileScannerController(
-    detectionSpeed: DetectionSpeed.normal,
+  final MobileScannerController _cameraController = MobileScannerController(
+    detectionSpeed:
+    kIsWeb ? DetectionSpeed.noDuplicates : DetectionSpeed.normal,
     facing: CameraFacing.back,
     autoStart: true,
   );
 
-  // يمنع استقبال أي QR جديد أثناء معالجة QR الحالي.
-  bool _isCameraLocked = false;
+  final Queue<String> _scanQueue = Queue<String>();
 
-  // مؤقت لإخفاء نتيجة المسح.
+  bool _isProcessing = false;
+  String? _activeScan;
   Timer? _resultTimer;
 
   @override
@@ -39,115 +41,102 @@ class _ScannerViewState extends ConsumerState<ScannerView> {
     super.dispose();
   }
 
-  // ============================================================
-  // معالجة عملية المسح بالكامل
-  // ============================================================
-
-  Future<void> _handleScan(String value) async {
-    // حماية من استقبال أكثر من QR
-    if (_isCameraLocked) {
+  void _queueScan(String value) {
+    if (value == _activeScan || _scanQueue.contains(value)) {
       return;
     }
 
-    _isCameraLocked = true;
+    _scanQueue.addLast(value);
 
-    debugPrint('========================================');
-    debugPrint('QR SCAN STARTED');
-    debugPrint('========================================');
+    if (!_isProcessing) {
+      unawaited(_processNextScan());
+    }
+  }
+
+  Future<void> _processNextScan() async {
+    if (_isProcessing || _scanQueue.isEmpty || !mounted) {
+      return;
+    }
+
+    _isProcessing = true;
+    final value = _scanQueue.removeFirst();
+    _activeScan = value;
 
     try {
-      // ========================================================
-      // 1. إيقاف الكاميرا فوراً
-      // ========================================================
-
-      await _cameraController.stop();
-
-      // ========================================================
-      // 2. معالجة QR
-      // ========================================================
+      // على الويب نترك الكاميرا تعمل باستمرار.
+      // على التطبيق الأصلي نحافظ على سلوك إيقافها مؤقتًا.
+      if (!kIsWeb) {
+        await _cameraController.stop();
+      }
 
       await ref
           .read(scannerProvider.notifier)
           .processScannedCode(value);
 
-      // ========================================================
-      // 3. عرض النتيجة لمدة القفل
-      // ========================================================
+      if (kIsWeb) {
+        _resultTimer?.cancel();
+        _resultTimer = Timer(
+          const Duration(milliseconds: 1200),
+          _resetScanResult,
+        );
+      } else {
+        await Future<void>.delayed(
+          const Duration(milliseconds: 1200),
+        );
 
-      await Future.delayed(
-        const Duration(milliseconds: 1200),
-      );
+        if (!mounted) {
+          return;
+        }
 
-      if (!mounted) {
-        return;
+        ref.read(scannerProvider.notifier).resetToIdle();
+        await _cameraController.start();
       }
-
-      // ========================================================
-      // 4. إخفاء دائرة النتيجة فور انتهاء مدة القفل
-      // ========================================================
-
-      ref
-          .read(scannerProvider.notifier)
-          .resetToIdle();
-
-      // ========================================================
-      // 5. تشغيل الكاميرا من جديد
-      // ========================================================
-
-      await _cameraController.start();
-    } catch (e) {
-      debugPrint('Scanner handling error: $e');
+    } catch (error) {
+      debugPrint('Scanner handling error: $error');
 
       if (mounted) {
-        // إخفاء النتيجة حتى في حالة الخطأ
-        ref
-            .read(scannerProvider.notifier)
-            .resetToIdle();
+        ref.read(scannerProvider.notifier).resetToIdle();
 
-        try {
-          await _cameraController.start();
-        } catch (cameraError) {
-          debugPrint(
-            'Camera restart error: $cameraError',
-          );
+        if (!kIsWeb) {
+          try {
+            await _cameraController.start();
+          } catch (cameraError) {
+            debugPrint('Camera restart error: $cameraError');
+          }
         }
       }
     } finally {
-      _isCameraLocked = false;
+      _activeScan = null;
+      _isProcessing = false;
 
-      debugPrint('========================================');
-      debugPrint('QR SCAN READY FOR NEXT STUDENT');
-      debugPrint('========================================');
+      if (mounted && _scanQueue.isNotEmpty) {
+        unawaited(_processNextScan());
+      }
     }
   }
 
-  // ============================================================
-  // نتيجة المسح الكبيرة في منتصف الكاميرا
-  // ============================================================
+  void _resetScanResult() {
+    if (!mounted) {
+      return;
+    }
 
-  Widget _buildScanResultOverlay(
-      ScanResultState scanState,
-      ) {
+    ref.read(scannerProvider.notifier).resetToIdle();
+  }
+
+  Widget _buildScanResultOverlay(ScanResultState scanState) {
     if (scanState.status == ScanStatusType.idle) {
       return const SizedBox.shrink();
     }
 
-    final bool isSuccess =
-        scanState.status == ScanStatusType.success;
-
-    final bool isDuplicate =
-        scanState.status == ScanStatusType.duplicate;
-
-    final bool isInvalid =
-        scanState.status == ScanStatusType.invalid;
+    final bool isSuccess = scanState.status == ScanStatusType.success;
+    final bool isDuplicate = scanState.status == ScanStatusType.duplicate;
+    final bool isInvalid = scanState.status == ScanStatusType.invalid;
 
     if (!isSuccess && !isDuplicate && !isInvalid) {
       return const SizedBox.shrink();
     }
 
-    // تحديد اللون حسب النتيجة
     final Color color;
-
     if (isSuccess) {
       color = Colors.green;
     } else if (isDuplicate) {
@@ -156,23 +145,16 @@ class _ScannerViewState extends ConsumerState<ScannerView> {
       color = Colors.red;
     }
 
-    // تحديد الأيقونة
     final IconData icon =
-    isSuccess
-        ? Icons.check_circle_rounded
-        : Icons.cancel_rounded;
+    isSuccess ? Icons.check_circle_rounded : Icons.cancel_rounded;
 
-    // تحديد العنوان
-    final String title =
-    isSuccess
+    final String title = isSuccess
         ? 'تم قبول QR'
         : isDuplicate
         ? 'تم تسجيله من قبل'
         : 'تم رفض QR';
 
-    // تحديد الوصف
-    final String subtitle =
-    isSuccess
+    final String subtitle = isSuccess
         ? 'تم تسجيل حضور الطالب بنجاح'
         : isDuplicate
         ? 'هذا الطالب مسجل حضور مسبقاً'
@@ -184,16 +166,12 @@ class _ScannerViewState extends ConsumerState<ScannerView> {
           color: Colors.black.withOpacity(0.45),
           child: Center(
             child: AnimatedScale(
-              scale: 1.0,
+              scale: 1,
               duration: const Duration(milliseconds: 250),
               curve: Curves.easeOutBack,
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  // ==================================================
-                  // الدائرة الكبيرة
-                  // ==================================================
-
                   Container(
                     width: 150,
                     height: 150,
@@ -214,13 +192,7 @@ class _ScannerViewState extends ConsumerState<ScannerView> {
                       size: 105,
                     ),
                   ),
-
                   const SizedBox(height: 24),
-
-                  // ==================================================
-                  // العنوان
-                  // ==================================================
-
                   Text(
                     title,
                     textAlign: TextAlign.center,
@@ -230,17 +202,9 @@ class _ScannerViewState extends ConsumerState<ScannerView> {
                       fontWeight: FontWeight.bold,
                     ),
                   ),
-
                   const SizedBox(height: 8),
-
-                  // ==================================================
-                  // الوصف
-                  // ==================================================
-
                   Padding(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 24,
-                    ),
+                    padding: const EdgeInsets.symmetric(horizontal: 24),
                     child: Text(
                       subtitle,
                       textAlign: TextAlign.center,
@@ -251,11 +215,6 @@ class _ScannerViewState extends ConsumerState<ScannerView> {
                       ),
                     ),
                   ),
-
-                  // ==================================================
-                  // اسم الطالب
-                  // ==================================================
-
                   if (scanState.record != null) ...[
                     const SizedBox(height: 12),
                     Text(
@@ -280,94 +239,75 @@ class _ScannerViewState extends ConsumerState<ScannerView> {
   @override
   Widget build(BuildContext context) {
     final scanState = ref.watch(scannerProvider);
-
-    final scannerNotifier =
-    ref.read(scannerProvider.notifier);
-
-    final todayRecords =
-        scannerNotifier.todayRecords;
-
-    final todayDate =
-    DateFormatter.formatDate(DateTime.now());
+    final scannerNotifier = ref.read(scannerProvider.notifier);
+    final todayRecords = scannerNotifier.todayRecords;
+    final todayDate = DateFormatter.formatDate(DateTime.now());
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text(
-          'تسجيل الحضور الجامعي',
-        ),
+        title: const Text('تسجيل الحضور الجامعي'),
         actions: [
-          IconButton(
-            icon: const Icon(
-              Icons.flash_on,
-              color: Colors.white,
+          if (!kIsWeb)
+            IconButton(
+              icon: const Icon(
+                Icons.flash_on,
+                color: Colors.white,
+              ),
+              onPressed: _isProcessing
+                  ? null
+                  : () {
+                _cameraController.toggleTorch();
+              },
             ),
-            onPressed: _isCameraLocked
-                ? null
-                : () {
-              _cameraController.toggleTorch();
-            },
-          ),
         ],
       ),
       body: SafeArea(
         child: Padding(
-          padding: const EdgeInsets.all(16.0),
+          padding: const EdgeInsets.all(16),
           child: Column(
             children: [
-              // ======================================================
-              // Header Metadata Info
-              // ======================================================
-
               Card(
                 child: Padding(
                   padding: const EdgeInsets.symmetric(
-                    horizontal: 16.0,
-                    vertical: 12.0,
+                    horizontal: 16,
+                    vertical: 12,
                   ),
                   child: Row(
-                    mainAxisAlignment:
-                    MainAxisAlignment.spaceBetween,
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
                       Column(
-                        crossAxisAlignment:
-                        CrossAxisAlignment.start,
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           const Text(
                             'التاريخ الحالي',
                             style: TextStyle(
                               fontSize: 12,
-                              color:
-                              AppColors.textSecondary,
+                              color: AppColors.textSecondary,
                             ),
                           ),
                           Text(
                             todayDate,
                             style: const TextStyle(
                               fontSize: 15,
-                              fontWeight:
-                              FontWeight.bold,
+                              fontWeight: FontWeight.bold,
                             ),
                           ),
                         ],
                       ),
                       Container(
-                        padding:
-                        const EdgeInsets.symmetric(
+                        padding: const EdgeInsets.symmetric(
                           horizontal: 12,
                           vertical: 6,
                         ),
                         decoration: BoxDecoration(
-                          color: AppColors.primary
-                              .withOpacity(0.1),
-                          borderRadius:
-                          BorderRadius.circular(20),
+                          color: AppColors.primary.withOpacity(0.1),
+                          borderRadius: BorderRadius.circular(20),
                         ),
                         child: Text(
                           'تم مسح: ${todayRecords.length} طالبًا',
                           style: const TextStyle(
                             color: AppColors.primary,
-                            fontWeight:
-                            FontWeight.bold,
+                            fontWeight: FontWeight.bold,
                             fontSize: 14,
                           ),
                         ),
@@ -376,129 +316,53 @@ class _ScannerViewState extends ConsumerState<ScannerView> {
                   ),
                 ),
               ),
-
               const SizedBox(height: 12),
-
-              // ======================================================
-              // Camera
-              // ======================================================
-
               Expanded(
                 child: ClipRRect(
-                  borderRadius:
-                  BorderRadius.circular(24),
+                  borderRadius: BorderRadius.circular(24),
                   child: Stack(
                     fit: StackFit.expand,
                     children: [
-                      // ==================================================
-                      // الكاميرا
-                      // ==================================================
-
                       MobileScanner(
-                        controller:
-                        _cameraController,
-
-                        onDetectError:
-                            (error, stackTrace) {
-                          debugPrint(
-                            '========================================',
-                          );
-                          debugPrint(
-                            'MOBILE SCANNER ERROR',
-                          );
-                          debugPrint(
-                            'ERROR: ${error.toString()}',
-                          );
-                          debugPrint(
-                            'STACK TRACE:',
-                          );
-                          debugPrint(
-                            stackTrace.toString(),
-                          );
-                          debugPrint(
-                            '========================================',
-                          );
+                        controller: _cameraController,
+                        onDetectError: (error, stackTrace) {
+                          debugPrint('MOBILE SCANNER ERROR: $error');
+                          debugPrint(stackTrace.toString());
                         },
-
                         onDetect: (capture) {
-                          // حماية سريعة جداً قبل الدخول
-                          // في أي معالجة.
-                          if (_isCameraLocked) {
-                            return;
-                          }
+                          for (final barcode in capture.barcodes) {
+                            final String? value = barcode.rawValue;
 
-                          for (final barcode
-                          in capture.barcodes) {
-                            final String? value =
-                                barcode.rawValue;
-
-                            if (value != null &&
-                                value.isNotEmpty) {
-                              _handleScan(value);
+                            if (value != null && value.isNotEmpty) {
+                              _queueScan(value);
                               break;
                             }
                           }
                         },
                       ),
-
-                      // ==================================================
-                      // إطار المسح الأصلي
-                      // ==================================================
-
                       const ScannerOverlay(),
-
-                      // ==================================================
-                      // نتيجة المسح
-                      // أخضر = قبول
-                      // أحمر = رفض
-                      // ==================================================
-
-                      _buildScanResultOverlay(
-                        scanState,
-                      ),
+                      _buildScanResultOverlay(scanState),
                     ],
                   ),
                 ),
               ),
-
               const SizedBox(height: 12),
-
-              // ======================================================
-              // Recent Scanned Result Card
-              // ======================================================
-
-              RecentScannedCard(
-                scanState: scanState,
-              ),
-
+              RecentScannedCard(scanState: scanState),
               const SizedBox(height: 12),
-
-              // ======================================================
-              // Export PDF Button
-              // ======================================================
-
               ElevatedButton.icon(
                 style: ElevatedButton.styleFrom(
-                  backgroundColor:
-                  AppColors.accent,
+                  backgroundColor: AppColors.accent,
                 ),
-                icon: const Icon(
-                  Icons.send_rounded,
-                ),
-                label: const Text(
-                  'إرسال الكشف',
-                ),
+                icon: const Icon(Icons.send_rounded),
+                label: const Text('إرسال الكشف'),
                 onPressed: () {
                   if (todayRecords.isEmpty) {
-                    ScaffoldMessenger.of(
-                      context,
-                    ).showSnackBar(
+                    ScaffoldMessenger.of(context).showSnackBar(
                       const SnackBar(
                         content: Text(
                           'لا توجد عمليات مسح. يرجى مسح بطاقة واحدة على الأقل.',
                         ),
-                        backgroundColor:
-                        AppColors.warning,
+                        backgroundColor: AppColors.warning,
                       ),
                     );
                     return;
@@ -506,10 +370,9 @@ class _ScannerViewState extends ConsumerState<ScannerView> {
 
                   showDialog(
                     context: context,
-                    builder: (ctx) =>
-                        ExportSummaryDialog(
-                          records: todayRecords,
-                        ),
+                    builder: (context) => ExportSummaryDialog(
+                      records: todayRecords,
+                    ),
                   );
                 },
               ),
