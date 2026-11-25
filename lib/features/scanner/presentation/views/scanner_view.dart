@@ -32,13 +32,35 @@ class _ScannerViewState extends ConsumerState<ScannerView> {
 
   bool _isProcessing = false;
   String? _activeScan;
+  String? _lastBarcodeInView;
+
   Timer? _resultTimer;
+  Timer? _barcodePresenceTimer;
 
   @override
   void dispose() {
     _resultTimer?.cancel();
+    _barcodePresenceTimer?.cancel();
     _cameraController.dispose();
     super.dispose();
+  }
+
+  void _handleDetectedBarcode(String value) {
+    _barcodePresenceTimer?.cancel();
+
+    _barcodePresenceTimer = Timer(
+      const Duration(seconds: 3),
+          () {
+        _lastBarcodeInView = null;
+      },
+    );
+
+    if (value == _lastBarcodeInView) {
+      return;
+    }
+
+    _lastBarcodeInView = value;
+    _queueScan(value);
   }
 
   void _queueScan(String value) {
@@ -63,8 +85,8 @@ class _ScannerViewState extends ConsumerState<ScannerView> {
     _activeScan = value;
 
     try {
-      // على الويب نترك الكاميرا تعمل باستمرار.
-      // على التطبيق الأصلي نحافظ على سلوك إيقافها مؤقتًا.
+      // على الويب تبقى الكاميرا مفتوحة؛ على التطبيق الأصلي
+      // نحافظ على سلوك إيقافها مؤقتًا أثناء معالجة البطاقة.
       if (!kIsWeb) {
         await _cameraController.stop();
       }
@@ -334,7 +356,7 @@ class _ScannerViewState extends ConsumerState<ScannerView> {
                             final String? value = barcode.rawValue;
 
                             if (value != null && value.isNotEmpty) {
-                              _queueScan(value);
+                              _handleDetectedBarcode(value);
                               break;
                             }
                           }
